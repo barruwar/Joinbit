@@ -20,6 +20,12 @@
 (define-constant err-proposal-already-executed (err u115))
 (define-constant err-voting-period-not-ended (err u116))
 (define-constant err-invalid-proposal-type (err u117))
+(define-constant err-invalid-referral-code (err u118))
+(define-constant err-self-referral (err u119))
+(define-constant err-referral-cooldown (err u120))
+(define-constant err-referrer-not-active (err u121))
+(define-constant err-max-referrals-reached (err u122))
+(define-constant err-referral-code-exists (err u123))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-proposal-id uint u0)
@@ -28,6 +34,9 @@
 (define-data-var quorum-percentage uint u25)
 (define-data-var membership-price uint u1000000)
 (define-data-var contract-paused bool false)
+(define-data-var referral-cooldown-blocks uint u144)
+(define-data-var max-referrals-per-member uint u100)
+(define-data-var total-referral-codes uint u0)
 
 (define-map token-count principal uint)
 (define-map membership-tiers uint {tier: (string-ascii 20), benefits: (string-ascii 100), price: uint})
@@ -51,6 +60,11 @@
 })
 (define-map proposal-votes {proposal-id: uint, voter: principal} {vote: bool, weight: uint})
 (define-map reputation-rewards principal {total-earned: uint, last-claim: uint})
+(define-map referral-codes (string-ascii 10) {owner: principal, created-at: uint, total-referrals: uint})
+(define-map member-referrals principal {referrer: principal, referred-at: uint, rewards-earned: uint})
+(define-map referral-stats principal {total-referred: uint, total-earned: uint, last-referral: uint})
+(define-map tier-commission-rates uint {bronze-rate: uint, silver-rate: uint, gold-rate: uint})
+(define-map referral-leaderboard uint {member: principal, referral-count: uint, total-earnings: uint})
 
 (define-public (mint-membership (recipient principal) (tier uint))
   (let
@@ -426,6 +440,206 @@
   )
 )
 
+(define-public (generate-referral-code (code (string-ascii 10)))
+  (let
+    (
+      (existing-code (map-get? referral-codes code))
+      (member-perks (map-get? member-benefits tx-sender))
+    )
+    (asserts! (is-membership-active tx-sender) err-membership-not-active)
+    (asserts! (is-none existing-code) err-referral-code-exists)
+    (map-set referral-codes code {
+      owner: tx-sender,
+      created-at: stacks-block-height,
+      total-referrals: u0
+    })
+    (var-set total-referral-codes (+ (var-get total-referral-codes) u1))
+    (ok true)
+  )
+)
+
+(define-public (purchase-membership-with-referral (tier uint) (referral-code (string-ascii 10)))
+  (let
+    (
+      (tier-info (unwrap! (map-get? membership-tiers tier) err-invalid-membership-tier))
+      (price (get price tier-info))
+      (referral-info (unwrap! (map-get? referral-codes referral-code) err-invalid-referral-code))
+      (referrer (get owner referral-info))
+      (referrer-benefits (map-get? member-benefits referrer))
+      (referrer-stats (default-to {total-referred: u0, total-earned: u0, last-referral: u0} (map-get? referral-stats referrer)))
+      (last-referral-time (get last-referral referrer-stats))
+      (commission-rates (default-to {bronze-rate: u5, silver-rate: u10, gold-rate: u15} (map-get? tier-commission-rates u1)))
+      (referrer-tier (match referrer-benefits benefits (get tier benefits) u1))
+      (commission-rate (if (is-eq referrer-tier u3) (get gold-rate commission-rates)
+                       (if (is-eq referrer-tier u2) (get silver-rate commission-rates)
+                       (get bronze-rate commission-rates))))
+      (referral-reward (/ (* price commission-rate) u100))
+      (token-id (+ (var-get last-token-id) u1))
+    )
+    (asserts! (not (var-get contract-paused)) err-membership-not-active)
+    (asserts! (not (is-eq tx-sender referrer)) err-self-referral)
+    (asserts! (is-membership-active referrer) err-referrer-not-active)
+    (asserts! (>= stacks-block-height (+ last-referral-time (var-get referral-cooldown-blocks))) err-referral-cooldown)
+    (asserts! (< (get total-referred referrer-stats) (var-get max-referrals-per-member)) err-max-referrals-reached)
+    (begin
+      (try! (stx-transfer? price tx-sender contract-owner))
+      (try! (stx-transfer? referral-reward contract-owner referrer))
+      (try! (nft-mint? joinbit-membership token-id tx-sender))
+      (var-set last-token-id token-id)
+      (map-set token-count tx-sender (+ (default-to u0 (map-get? token-count tx-sender)) u1))
+      (map-set member-benefits tx-sender {
+        tier: tier,
+        expires-at: (+ stacks-block-height u52560),
+        active: true
+      })
+      (map-set member-reputation tx-sender {
+        reputation: u50,
+        last-activity: stacks-block-height,
+        votes-cast: u0
+      })
+      (map-set member-referrals tx-sender {
+        referrer: referrer,
+        referred-at: stacks-block-height,
+        rewards-earned: u0
+      })
+      (map-set referral-codes referral-code (merge referral-info {
+        total-referrals: (+ (get total-referrals referral-info) u1)
+      }))
+      (map-set referral-stats referrer {
+        total-referred: (+ (get total-referred referrer-stats) u1),
+        total-earned: (+ (get total-earned referrer-stats) referral-reward),
+        last-referral: stacks-block-height
+      })
+      (unwrap! (update-referral-leaderboard referrer) err-membership-not-active)
+      (ok token-id)
+    )
+  )
+)
+
+(define-public (claim-referral-rewards)
+  (let
+    (
+      (member-stats (default-to {total-referred: u0, total-earned: u0, last-referral: u0} (map-get? referral-stats tx-sender)))
+      (pending-rewards (get total-earned member-stats))
+    )
+    (asserts! (is-membership-active tx-sender) err-membership-not-active)
+    (asserts! (> pending-rewards u0) err-insufficient-payment)
+    (map-set referral-stats tx-sender {
+      total-referred: (get total-referred member-stats),
+      total-earned: u0,
+      last-referral: (get last-referral member-stats)
+    })
+    (try! (stx-transfer? pending-rewards contract-owner tx-sender))
+    (ok pending-rewards)
+  )
+)
+
+(define-public (set-commission-rates (tier uint) (bronze uint) (silver uint) (gold uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set tier-commission-rates tier {
+      bronze-rate: bronze,
+      silver-rate: silver,
+      gold-rate: gold
+    })
+    (ok true)
+  )
+)
+
+(define-public (update-referral-params (cooldown uint) (max-referrals uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set referral-cooldown-blocks cooldown)
+    (var-set max-referrals-per-member max-referrals)
+    (ok true)
+  )
+)
+
+(define-private (update-referral-leaderboard (member principal))
+  (let
+    (
+      (member-stats (default-to {total-referred: u0, total-earned: u0, last-referral: u0} (map-get? referral-stats member)))
+      (referral-count (get total-referred member-stats))
+      (total-earnings (get total-earned member-stats))
+      (next-position (+ (var-get total-referral-codes) u1))
+    )
+    (map-set referral-leaderboard next-position {
+      member: member,
+      referral-count: referral-count,
+      total-earnings: total-earnings
+    })
+    (ok true)
+  )
+)
+
+(define-public (boost-referral-rewards (member principal) (bonus-amount uint))
+  (let
+    (
+      (member-stats (default-to {total-referred: u0, total-earned: u0, last-referral: u0} (map-get? referral-stats member)))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-membership-active member) err-membership-not-active)
+    (map-set referral-stats member {
+      total-referred: (get total-referred member-stats),
+      total-earned: (+ (get total-earned member-stats) bonus-amount),
+      last-referral: (get last-referral member-stats)
+    })
+    (unwrap! (update-referral-leaderboard member) err-membership-not-active)
+    (ok true)
+  )
+)
+
+(define-read-only (get-referral-code-info (code (string-ascii 10)))
+  (map-get? referral-codes code)
+)
+
+(define-read-only (get-member-referral-info (member principal))
+  (map-get? member-referrals member)
+)
+
+(define-read-only (get-referral-stats (member principal))
+  (map-get? referral-stats member)
+)
+
+(define-read-only (get-commission-rates (tier uint))
+  (map-get? tier-commission-rates tier)
+)
+
+(define-read-only (get-referral-leaderboard (position uint))
+  (map-get? referral-leaderboard position)
+)
+
+(define-read-only (get-leaderboard-position (member principal))
+  (some u1)
+)
+
+(define-read-only (get-referral-system-stats)
+  {
+    total-referral-codes: (var-get total-referral-codes),
+    referral-cooldown-blocks: (var-get referral-cooldown-blocks),
+    max-referrals-per-member: (var-get max-referrals-per-member)
+  }
+)
+
+(define-read-only (calculate-potential-reward (tier uint) (referrer-tier uint))
+  (let
+    (
+      (tier-info (map-get? membership-tiers tier))
+      (commission-rates (default-to {bronze-rate: u5, silver-rate: u10, gold-rate: u15} (map-get? tier-commission-rates u1)))
+      (commission-rate (if (is-eq referrer-tier u3) (get gold-rate commission-rates)
+                       (if (is-eq referrer-tier u2) (get silver-rate commission-rates)
+                       (get bronze-rate commission-rates))))
+    )
+    (match tier-info
+      membership-info (some (/ (* (get price membership-info) commission-rate) u100))
+      none
+    )
+  )
+)
+
 (map-set membership-tiers u1 {tier: "Bronze", benefits: "Basic access to community features", price: u1000000})
 (map-set membership-tiers u2 {tier: "Silver", benefits: "Premium features + priority support", price: u5000000})
 (map-set membership-tiers u3 {tier: "Gold", benefits: "All features + exclusive events", price: u10000000})
+(map-set tier-commission-rates u1 {bronze-rate: u5, silver-rate: u10, gold-rate: u15})
+
+
