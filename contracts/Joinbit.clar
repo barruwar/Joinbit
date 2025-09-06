@@ -26,6 +26,9 @@
 (define-constant err-referrer-not-active (err u121))
 (define-constant err-max-referrals-reached (err u122))
 (define-constant err-referral-code-exists (err u123))
+(define-constant err-streak-not-found (err u124))
+(define-constant err-streak-already-claimed (err u125))
+(define-constant err-invalid-streak-length (err u126))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-proposal-id uint u0)
@@ -37,6 +40,9 @@
 (define-data-var referral-cooldown-blocks uint u144)
 (define-data-var max-referrals-per-member uint u100)
 (define-data-var total-referral-codes uint u0)
+(define-data-var streak-activity-window uint u144) ;; ~1 day in blocks
+(define-data-var min-streak-for-rewards uint u7)
+(define-data-var streak-base-reward uint u100000) ;; 0.1 STX base reward
 
 (define-map token-count principal uint)
 (define-map membership-tiers uint {tier: (string-ascii 20), benefits: (string-ascii 100), price: uint})
@@ -65,6 +71,9 @@
 (define-map referral-stats principal {total-referred: uint, total-earned: uint, last-referral: uint})
 (define-map tier-commission-rates uint {bronze-rate: uint, silver-rate: uint, gold-rate: uint})
 (define-map referral-leaderboard uint {member: principal, referral-count: uint, total-earnings: uint})
+(define-map loyalty-streaks principal {current-streak: uint, longest-streak: uint, last-activity: uint, total-rewards: uint})
+(define-map streak-milestones uint {days: uint, reward-multiplier: uint, reputation-bonus: uint})
+(define-map daily-streak-rewards {member: principal, day: uint} {claimed: bool, reward-amount: uint})
 
 (define-public (mint-membership (recipient principal) (tier uint))
   (let
@@ -151,6 +160,7 @@
     )
     (asserts! (is-eq tx-sender owner) err-not-token-owner)
     (map-set marketplace {token-id: token-id} {price: price, seller: tx-sender})
+    (unwrap! (update-activity-streak tx-sender) err-membership-not-active)
     (ok true)
   )
 )
@@ -308,6 +318,7 @@
     })
     (var-set last-proposal-id proposal-id)
     (try! (earn-reputation u10 "proposal-submit"))
+    (unwrap! (update-activity-streak tx-sender) err-membership-not-active)
     (ok proposal-id)
   )
 )
@@ -335,6 +346,7 @@
       votes-cast: (+ (get votes-cast voter-rep) u1)
     })
     (try! (earn-reputation u5 "vote-cast"))
+    (unwrap! (update-activity-streak tx-sender) err-membership-not-active)
     (ok true)
   )
 )
@@ -621,6 +633,104 @@
   }
 )
 
+;; === LOYALTY STREAK SYSTEM ===
+
+;; Initialize streak milestones
+(define-private (init-streak-milestones)
+  (begin
+    (map-set streak-milestones u1 {days: u7, reward-multiplier: u2, reputation-bonus: u10})
+    (map-set streak-milestones u2 {days: u30, reward-multiplier: u5, reputation-bonus: u25})
+    (map-set streak-milestones u3 {days: u90, reward-multiplier: u10, reputation-bonus: u50})
+    (map-set streak-milestones u4 {days: u365, reward-multiplier: u20, reputation-bonus: u100})
+    (ok true)
+  )
+)
+
+;; Update member activity and streak
+(define-private (update-activity-streak (member principal))
+  (let
+    (
+      (current-streak (default-to {current-streak: u0, longest-streak: u0, last-activity: u0, total-rewards: u0} (map-get? loyalty-streaks member)))
+      (last-activity (get last-activity current-streak))
+      (time-since-activity (- stacks-block-height last-activity))
+      (activity-window (var-get streak-activity-window))
+      (current-streak-count (get current-streak current-streak))
+      (longest-streak-count (get longest-streak current-streak))
+      (new-streak-count (if (<= time-since-activity activity-window)
+                        (+ current-streak-count u1)
+                        u1))
+      (new-longest-streak (if (> new-streak-count longest-streak-count) new-streak-count longest-streak-count))
+    )
+    (map-set loyalty-streaks member {
+      current-streak: new-streak-count,
+      longest-streak: new-longest-streak,
+      last-activity: stacks-block-height,
+      total-rewards: (get total-rewards current-streak)
+    })
+    (ok new-streak-count)
+  )
+)
+
+;; Calculate streak reward based on tier and streak length
+(define-private (calculate-streak-reward (member principal) (streak-days uint))
+  (let
+    (
+      (member-tier-info (map-get? member-benefits member))
+      (base-reward (var-get streak-base-reward))
+      (tier-multiplier (match member-tier-info benefits (get tier benefits) u1))
+      (streak-multiplier (if (>= streak-days u365) u20
+                        (if (>= streak-days u90) u10
+                        (if (>= streak-days u30) u5
+                        (if (>= streak-days u7) u2 u1)))))
+    )
+    (* base-reward tier-multiplier streak-multiplier)
+  )
+)
+
+;; Public function to claim streak rewards
+(define-public (claim-streak-reward)
+  (let
+    (
+      (member-streak (unwrap! (map-get? loyalty-streaks tx-sender) err-streak-not-found))
+      (current-streak (get current-streak member-streak))
+      (min-streak (var-get min-streak-for-rewards))
+      (reward-amount (calculate-streak-reward tx-sender current-streak))
+      (current-day (/ stacks-block-height (var-get streak-activity-window)))
+      (existing-claim (map-get? daily-streak-rewards {member: tx-sender, day: current-day}))
+    )
+    (asserts! (is-membership-active tx-sender) err-membership-not-active)
+    (asserts! (>= current-streak min-streak) err-invalid-streak-length)
+    (asserts! (is-none existing-claim) err-streak-already-claimed)
+    (asserts! (> reward-amount u0) err-insufficient-payment)
+    
+    (map-set daily-streak-rewards {member: tx-sender, day: current-day} {
+      claimed: true,
+      reward-amount: reward-amount
+    })
+    
+    (map-set loyalty-streaks tx-sender {
+      current-streak: current-streak,
+      longest-streak: (get longest-streak member-streak),
+      last-activity: (get last-activity member-streak),
+      total-rewards: (+ (get total-rewards member-streak) reward-amount)
+    })
+    
+    (try! (stx-transfer? reward-amount contract-owner tx-sender))
+    (ok reward-amount)
+  )
+)
+
+;; Update streak parameters (admin only)
+(define-public (update-streak-params (activity-window uint) (min-streak uint) (base-reward uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set streak-activity-window activity-window)
+    (var-set min-streak-for-rewards min-streak)
+    (var-set streak-base-reward base-reward)
+    (ok true)
+  )
+)
+
 (define-read-only (calculate-potential-reward (tier uint) (referrer-tier uint))
   (let
     (
@@ -641,5 +751,53 @@
 (map-set membership-tiers u2 {tier: "Silver", benefits: "Premium features + priority support", price: u5000000})
 (map-set membership-tiers u3 {tier: "Gold", benefits: "All features + exclusive events", price: u10000000})
 (map-set tier-commission-rates u1 {bronze-rate: u5, silver-rate: u10, gold-rate: u15})
+
+;; === LOYALTY STREAK READ-ONLY FUNCTIONS ===
+
+(define-read-only (get-loyalty-streak (member principal))
+  (map-get? loyalty-streaks member)
+)
+
+(define-read-only (get-streak-milestone (milestone-id uint))
+  (map-get? streak-milestones milestone-id)
+)
+
+(define-read-only (get-daily-streak-reward (member principal) (day uint))
+  (map-get? daily-streak-rewards {member: member, day: day})
+)
+
+(define-read-only (get-streak-system-stats)
+  {
+    activity-window: (var-get streak-activity-window),
+    min-streak-for-rewards: (var-get min-streak-for-rewards),
+    base-reward: (var-get streak-base-reward)
+  }
+)
+
+(define-read-only (calculate-current-streak-reward (member principal))
+  (match (map-get? loyalty-streaks member)
+    streak-data (calculate-streak-reward member (get current-streak streak-data))
+    u0
+  )
+)
+
+(define-read-only (is-streak-reward-claimable (member principal))
+  (let
+    (
+      (member-streak (map-get? loyalty-streaks member))
+      (current-day (/ stacks-block-height (var-get streak-activity-window)))
+      (existing-claim (map-get? daily-streak-rewards {member: member, day: current-day}))
+    )
+    (match member-streak
+      streak-data (and 
+                    (>= (get current-streak streak-data) (var-get min-streak-for-rewards))
+                    (is-none existing-claim))
+      false
+    )
+  )
+)
+
+;; Initialize streak milestones on deployment
+(unwrap-panic (init-streak-milestones))
 
 

@@ -120,10 +120,64 @@ clarinet console
 - ✅ Marketplace listing protection
 - ✅ Contract pause mechanism
 
+## 🔥 Loyalty Streak System
+
+Joinbit now features an advanced loyalty streak system that rewards members for consistent daily engagement and activity!
+
+### 🎯 How It Works
+
+- **Daily Activity Tracking**: System automatically tracks member engagement across voting, proposals, and marketplace activities
+- **Streak Milestones**: Progressive rewards for 7, 30, 90, and 365-day streaks
+- **Tier-Based Multipliers**: Higher membership tiers earn greater streak rewards
+- **Daily Reward Claims**: Claim rewards once per day for active streaks
+
+### 🏆 Reward Structure
+
+#### Base Rewards (Bronze Members)
+- **7+ days**: 2x multiplier (0.2 STX)
+- **30+ days**: 5x multiplier (0.5 STX) 
+- **90+ days**: 10x multiplier (1.0 STX)
+- **365+ days**: 20x multiplier (2.0 STX)
+
+#### Tier Multipliers
+- **Bronze**: 1x base reward
+- **Silver**: 2x base reward  
+- **Gold**: 3x base reward
+
+### 🚀 New Functions
+
+#### Public Functions
+- `claim-streak-reward()` - Claim daily streak rewards (minimum 7-day streak)
+- `update-streak-params(window, min-streak, base-reward)` - Admin function to adjust parameters
+
+#### Read-Only Functions
+- `get-loyalty-streak(member)` - View member's current and longest streaks
+- `get-streak-milestone(milestone-id)` - Get milestone reward details
+- `calculate-current-streak-reward(member)` - Preview potential reward amount
+- `is-streak-reward-claimable(member)` - Check if daily reward is available
+- `get-streak-system-stats()` - View system configuration
+
+### 💡 Usage Examples
+
+#### Check Your Streak Status
+```clarity
+(contract-call? .Joinbit get-loyalty-streak tx-sender)
+```
+
+#### Claim Daily Streak Reward
+```clarity
+(contract-call? .Joinbit claim-streak-reward)
+```
+
+#### Preview Reward Amount
+```clarity
+(contract-call? .Joinbit calculate-current-streak-reward tx-sender)
+```
+
 ## 📈 Roadmap
 
+- [x] 🏆 Loyalty rewards for long-term members ✅
 - [ ] 🎨 Metadata and visual NFT attributes
-- [ ] 🏆 Loyalty rewards for long-term members
 - [ ] 🤝 Partnership integrations
 - [ ] 📱 Mobile app integration
 - [ ] 🔔 Expiration notifications
